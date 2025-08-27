@@ -10,7 +10,8 @@ def backtest(symbol: str = 'BTCUSDT', interval: str = '30m', lookback: int = 400
     wins = 0; losses = 0; pnls = []
     for i in range(60, len(df)):
         sub = df.iloc[:i]
-        sig = ma.generate_signal(symbol, sub, interval=interval)
+        # 백테스트는 필터 완화(상위TF/파생 게이트 무시)
+        sig = ma.generate_signal(symbol, sub, interval=interval, relaxed=True, ignore_derivatives=True)
         if not sig:
             continue
         entry = sig['entry_prices'][0]

@@ -25,6 +25,7 @@ class SignalBot:
         self.sent_signals = set()  # 중복 전송 방지
         self.cooldowns = {}  # {(symbol, interval): last_timestamp}
         self.open_signals = {}  # {(symbol, interval): signal_dict}
+        self._last_update_id = None  # 텔레그램 명령 폴링 위치
         try:
             init_db()
             for s in load_open_signals():
@@ -162,8 +163,33 @@ class SignalBot:
                     if df is None:
                         logger.debug(f"{symbol} {interval}: 지표 계산 실패")
                         return False
-                    adv = self.generator.generate_advanced_signal(symbol, df)
-                    if adv and adv.get('confidence', 0) >= QUALITY_MIN_CONFIDENCE and self._cooldown_ok(symbol, interval):
+                    # 실시간 완화 모드: 생성은 완화, 전송 기준은 강화
+                    if REALTIME_RELAXED:
+                        base = self.analyzer.generate_signal(
+                            symbol, df, interval=interval,
+                            relaxed=RELAXED_IGNORE_MTF,
+                            ignore_derivatives=RELAXED_IGNORE_DERIVATIVES
+                        )
+                        adv = None
+                        if base:
+                            adv = self.generator.generate_advanced_signal(symbol, df)
+                            if adv:
+                                # 전송 임계 상향
+                                rr = adv.get('risk_reward')
+                                rr_ok = (rr and rr.get('avg_reward_ratio') is not None and float(rr['avg_reward_ratio']) >= RELAXED_MIN_RR_AVG)
+                                conf_ok = adv.get('confidence', 0) >= max(QUALITY_MIN_CONFIDENCE, RELAXED_MIN_CONFIDENCE)
+                                if not (rr_ok and conf_ok):
+                                    adv = None
+                    else:
+                        adv = self.generator.generate_advanced_signal(symbol, df)
+                        if adv:
+                            rr = adv.get('risk_reward')
+                            rr_ok = (rr and rr.get('avg_reward_ratio') is not None and float(rr['avg_reward_ratio']) >= MIN_RR_AVG)
+                            conf_ok = adv.get('confidence', 0) >= QUALITY_MIN_CONFIDENCE
+                            if not (rr_ok and conf_ok):
+                                adv = None
+
+                    if adv and self._cooldown_ok(symbol, interval):
                         adv['interval'] = interval
                         ok = await self.send_signal(adv)
                         if ok:
@@ -177,14 +203,19 @@ class SignalBot:
                             return True
                     # 세부 원인 로깅
                     try:
-                        base = self.analyzer.generate_signal(symbol, df, interval=interval)
+                        base = self.analyzer.generate_signal(
+                            symbol, df, interval=interval,
+                            relaxed=REALTIME_RELAXED and RELAXED_IGNORE_MTF,
+                            ignore_derivatives=REALTIME_RELAXED and RELAXED_IGNORE_DERIVATIVES
+                        )
                         if not base:
                             logger.info(f"필터 통과 실패: {symbol} {interval} | 베이식 신호 없음(MTF/레짐/펀딩/OI/롱숏비/조건 미충족)")
                         else:
                             rr = self.generator.calculate_risk_reward_ratio(base['entry_prices'][0], base['stop_loss'], base['profit_targets'])
-                            if rr and rr.get('avg_reward_ratio') is not None and float(rr['avg_reward_ratio']) < float(MIN_RR_AVG):
+                            rr_min = RELAXED_MIN_RR_AVG if REALTIME_RELAXED else MIN_RR_AVG
+                            if rr and rr.get('avg_reward_ratio') is not None and float(rr['avg_reward_ratio']) < float(rr_min):
                                 logger.info(f"필터 통과 실패: {symbol} {interval} | R:R {rr['avg_reward_ratio']:.2f} < {MIN_RR_AVG}")
-                            elif base.get('confidence', 0) < QUALITY_MIN_CONFIDENCE:
+                            elif base.get('confidence', 0) < (max(QUALITY_MIN_CONFIDENCE, RELAXED_MIN_CONFIDENCE) if REALTIME_RELAXED else QUALITY_MIN_CONFIDENCE):
                                 logger.info(f"품질 미달: {symbol} {interval} | 신뢰도 {base.get('confidence', 0)}% < {QUALITY_MIN_CONFIDENCE}%")
                             else:
                                 logger.info(f"고급 필터 미통과: {symbol} {interval}")
@@ -203,6 +234,31 @@ class SignalBot:
             
         except Exception as e:
             logger.error(f"시장 스캔 오류: {e}")
+
+    async def poll_commands(self):
+        """텔레그램 /명령어 폴링(짧게 1회)"""
+        try:
+            params = {}
+            if self._last_update_id is not None:
+                params['offset'] = self._last_update_id + 1
+            updates = await self.bot.get_updates(timeout=5, **params)
+            for u in updates or []:
+                try:
+                    self._last_update_id = u.update_id
+                    msg = getattr(u, 'message', None)
+                    if not msg or not getattr(msg, 'text', ''):
+                        continue
+                    text = msg.text.strip()
+                    if not text.startswith('/'):
+                        continue
+                    # 허용된 채팅에서만 처리
+                    if str(getattr(msg.chat, 'id', '')) != str(TELEGRAM_CHAT_ID):
+                        continue
+                    await self.handle_command(text)
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     async def process_symbol_interval(self, symbol: str, interval: str):
         """단일 심볼/타임프레임 처리 (WS 트리거용)"""
@@ -336,6 +392,7 @@ class SignalBot:
                 while True:
                     await self.scan_and_send_signals()
                     await self.monitor_open_signals()
+                    await self.poll_commands()
                     await asyncio.sleep(REALTIME_SCAN_SECONDS)
             asyncio.run(_loop())
         except KeyboardInterrupt:
@@ -360,6 +417,11 @@ class SignalBot:
         while True:
             try:
                 schedule.run_pending()
+                # 명령 폴링도 함께 수행
+                try:
+                    asyncio.run(self.poll_commands())
+                except Exception:
+                    pass
                 time.sleep(60)  # 1분마다 체크
             except KeyboardInterrupt:
                 logger.info("봇 종료됨")
@@ -489,6 +551,81 @@ class SignalBot:
                 lookback = int(parts[3]) if len(parts) > 3 else 400
                 report = bt_simple(symbol, interval, lookback)
                 await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🧪 백테스트 결과\n{report}")
+            elif cmd == '/status':
+                open_cnt = len(self.open_signals)
+                msg = (
+                    f"📡 상태\n"
+                    f"스캔 타임프레임: {', '.join(SCAN_INTERVALS)}\n"
+                    f"최소 신뢰도: {QUALITY_MIN_CONFIDENCE}% | 최소 R:R: {MIN_RR_AVG}\n"
+                    f"대상 심볼 수(최근): 30\n"
+                    f"오픈 시그널: {open_cnt}개"
+                )
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            elif cmd == '/top':
+                limit = int(parts[1]) if len(parts) > 1 else 15
+                syms = self.analyzer.get_top_symbols(limit=limit)
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"💠 상위 심볼 {len(syms)}개\n" + ', '.join(syms))
+            elif cmd == '/open':
+                if not self.open_signals:
+                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="열린 시그널 없음")
+                else:
+                    lines = []
+                    for (sym, iv), s in list(self.open_signals.items()):
+                        lines.append(f"#{sym} {s.get('type','-')} {iv} | EP {s['entry_prices'][0]} SL {s['stop_loss']}")
+                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="📜 오픈 시그널\n" + "\n".join(lines))
+            elif cmd in ('/metrics','/why','/debug'):
+                symbol = parts[1] if len(parts) > 1 else 'BTCUSDT'
+                interval = parts[2] if len(parts) > 2 else '30m'
+                df = self.analyzer.get_klines(symbol, interval=interval, limit=240, exclude_last_open=True)
+                if df is None:
+                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"데이터 없음: {symbol} {interval}")
+                    return
+                df = self.analyzer.calculate_technical_indicators(df)
+                if df is None:
+                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"지표 계산 실패: {symbol} {interval}")
+                    return
+                cur = df.iloc[-1]
+                # 파생 데이터
+                fr = self.analyzer.get_funding_rate(symbol)
+                oi = self.analyzer.get_open_interest_usdt(symbol)
+                lsr = self.analyzer.get_long_short_ratio(symbol)
+                # 레짐 체크
+                try:
+                    atr_pct = float(cur['atr'] / cur['close'] * 100) if cur['close'] else float('nan')
+                    bbw = float(cur['bb_width']) if pd.notna(cur['bb_width']) else float('nan')
+                except Exception:
+                    atr_pct, bbw = float('nan'), float('nan')
+                regime_ok = (
+                    (atr_pct == atr_pct and ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX) and
+                    (bbw == bbw and BB_WIDTH_MIN <= bbw <= BB_WIDTH_MAX)
+                )
+                # MTF 컨펌(방향별)
+                mtf_long = self.analyzer._mtf_confirm(symbol, 'LONG')
+                mtf_short = self.analyzer._mtf_confirm(symbol, 'SHORT')
+                # 시그널 프리뷰
+                base = self.analyzer.generate_signal(
+                    symbol, df, interval=interval,
+                    relaxed=REALTIME_RELAXED and RELAXED_IGNORE_MTF,
+                    ignore_derivatives=REALTIME_RELAXED and RELAXED_IGNORE_DERIVATIVES
+                )
+                preview = "없음"
+                rr_txt = ""
+                if base:
+                    rr = self.generator.calculate_risk_reward_ratio(base['entry_prices'][0], base['stop_loss'], base['profit_targets'])
+                    if rr and rr.get('avg_reward_ratio') is not None:
+                        rr_txt = f" | R:R {float(rr['avg_reward_ratio']):.2f}"
+                    preview = f"{base['type']} | 신뢰도 {base.get('confidence','-')}%{rr_txt}"
+                # 메시지
+                msg = (
+                    f"🔎 {symbol} {interval} 지표\n"
+                    f"가격 {float(cur['close']):.6f} | RSI {float(cur['rsi']):.2f} | ADX {float(cur['adx']):.2f}\n"
+                    f"MACD {float(cur['macd']):.4f} / {float(cur['macd_signal']):.4f} (hist {float(cur['macd_histogram']):.4f})\n"
+                    f"BB폭 {bbw:.4%} | ATR {float(cur['atr']):.6f} ({atr_pct:.2f}%)\n"
+                    f"펀딩 {fr:.4f}% | OI ${oi:,.0f} | 롱숏비 {lsr:.2f}\n"
+                    f"레짐 {'OK' if regime_ok else 'FAIL'} | MTF L:{'OK' if mtf_long else 'NO'} S:{'OK' if mtf_short else 'NO'}\n"
+                    f"시그널 프리뷰: {preview}"
+                )
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         except Exception as e:
             logger.error(f"명령 처리 오류: {e}")
 

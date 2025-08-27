@@ -53,8 +53,8 @@ BINANCE_SECRET_KEY=your_binance_secret_key_here
 ### 연속 모니터링 (기본)
 
 ```bash
-
-```python main.py
+python main.py
+```
 
 ### 단일 스캔 (테스트용)
 
@@ -100,6 +100,24 @@ Leverage
 - **PROFIT_TARGETS**: 백업용 % TP (ATR 불가 시)
 - **PARTIAL_TP_WEIGHTS**: 분할 익절 비중 예) [0.3,0.3,0.2,0.2]
 - **TRAILING_ATR_MULTIPLIER**: 트레일링 스탑 거리(ATR 배수)
+
+### 실시간 완화 모드(신호 생성 완화 + 전송 기준 강화)
+
+환경변수 또는 `.env` 에 아래 값을 추가하면, 실시간 스캔 시 상위TF/파생 게이트를 완화해 후보 신호를 더 넓게 잡고, 전송 기준은 더 높게 잡아 승률을 우선합니다.
+
+```env
+REALTIME_RELAXED=true                 # 실시간 완화 모드 ON
+RELAXED_IGNORE_MTF=true               # 상위TF 컨펌을 생성 단계에서 무시
+RELAXED_IGNORE_DERIVATIVES=true       # 펀딩/OI/롱숏비 게이트 생성 단계에서 무시
+RELAXED_MIN_CONFIDENCE=80             # 전송 최소 신뢰도(완화 모드)
+RELAXED_MIN_RR_AVG=2.5                # 전송 최소 평균 R:R(완화 모드)
+```
+
+실시간 실행:
+
+```bash
+python main.py --realtime
+```
 
 ## 🔧 고급 분석 기능
 

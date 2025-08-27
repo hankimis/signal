@@ -71,3 +71,11 @@ BB_WIDTH_MAX = float(os.getenv('BB_WIDTH_MAX', '0.2'))
 
 # 동적 사이징
 DYNAMIC_SIZING_MULTIPLIER_MAX = float(os.getenv('DYNAMIC_SIZING_MULTIPLIER_MAX', '1.5'))
+
+# ===== 실시간 완화 모드(신호 생성은 완화, 전송 기준은 강화) =====
+# 실시간 신호 생성 시 상위TF/파생 게이트를 완화하고 대신 더 높은 신뢰도/R:R를 요구
+REALTIME_RELAXED = os.getenv('REALTIME_RELAXED', 'false').lower() == 'true'
+RELAXED_IGNORE_MTF = os.getenv('RELAXED_IGNORE_MTF', 'true').lower() == 'true'
+RELAXED_IGNORE_DERIVATIVES = os.getenv('RELAXED_IGNORE_DERIVATIVES', 'true').lower() == 'true'
+RELAXED_MIN_CONFIDENCE = int(os.getenv('RELAXED_MIN_CONFIDENCE', '80'))
+RELAXED_MIN_RR_AVG = float(os.getenv('RELAXED_MIN_RR_AVG', '2.5'))

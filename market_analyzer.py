@@ -301,7 +301,7 @@ class MarketAnalyzer:
         except Exception:
             return None, None
 
-    def generate_signal(self, symbol, df, interval='30m'):
+    def generate_signal(self, symbol, df, interval='30m', relaxed=False, ignore_derivatives=False):
         """시그널 생성"""
         if df is None or len(df) < 50:
             return None
@@ -377,31 +377,35 @@ class MarketAnalyzer:
                 else:
                     long_bias_pct, short_bias_pct = 50, 50
             
-            # 파생 데이터 게이트(과열/저유동성 회피)
-            try:
-                fr = self.get_funding_rate(symbol)
-                oi_usdt = self.get_open_interest_usdt(symbol)
-                lsr = self.get_long_short_ratio(symbol)
-                if fr == fr and abs(fr) > MAX_FUNDING_ABS:
-                    return None
-                if oi_usdt == oi_usdt and oi_usdt < MIN_OPEN_INTEREST_USDT:
-                    return None
-                if lsr == lsr and (lsr >= LONG_SHORT_EXTREME_HIGH or lsr <= LONG_SHORT_EXTREME_LOW):
-                    return None
-            except Exception:
-                pass
+            # 파생 데이터 게이트(과열/저유동성 회피) - 백테스트/완화 모드면 생략
+            if not (relaxed or ignore_derivatives):
+                try:
+                    fr = self.get_funding_rate(symbol)
+                    oi_usdt = self.get_open_interest_usdt(symbol)
+                    lsr = self.get_long_short_ratio(symbol)
+                    if fr == fr and abs(fr) > MAX_FUNDING_ABS:
+                        return None
+                    if oi_usdt == oi_usdt and oi_usdt < MIN_OPEN_INTEREST_USDT:
+                        return None
+                    if lsr == lsr and (lsr >= LONG_SHORT_EXTREME_HIGH or lsr <= LONG_SHORT_EXTREME_LOW):
+                        return None
+                except Exception:
+                    pass
 
             # 시그널 생성 여부 결정
             if abs(total_score) >= 2:  # 최소 2개 이상의 조건 충족
                 signal_type = 'LONG' if total_score > 0 else 'SHORT'
 
                 # 상위 타임프레임 컨펌 게이트(신호 방향 일치 요구)
-                mtf_tailwind = self._mtf_confirm(symbol, signal_type)
-                if not mtf_tailwind:
-                    if MTF_CONFIRM_STRICT:
-                        return None
-                    else:
-                        total_score -= 1
+                if relaxed:
+                    mtf_tailwind = True
+                else:
+                    mtf_tailwind = self._mtf_confirm(symbol, signal_type)
+                    if not mtf_tailwind:
+                        if MTF_CONFIRM_STRICT:
+                            return None
+                        else:
+                            total_score -= 1
                 
                 # 진입가 계산
                 current_price = float(current['close'])

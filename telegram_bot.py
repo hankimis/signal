@@ -388,13 +388,20 @@ class SignalBot:
         logger.info("실시간 모니터링 시작...")
         try:
             import asyncio
-            async def _loop():
+            async def scan_loop():
                 while True:
                     await self.scan_and_send_signals()
                     await self.monitor_open_signals()
-                    await self.poll_commands()
                     await asyncio.sleep(REALTIME_SCAN_SECONDS)
-            asyncio.run(_loop())
+            async def command_loop():
+                while True:
+                    await self.poll_commands()
+                    await asyncio.sleep(1)
+            async def _main():
+                t1 = asyncio.create_task(scan_loop())
+                t2 = asyncio.create_task(command_loop())
+                await asyncio.gather(t1, t2)
+            asyncio.run(_main())
         except KeyboardInterrupt:
             logger.info("실시간 모니터링 중단")
         except Exception as e:
@@ -416,19 +423,20 @@ class SignalBot:
         
         while True:
             try:
-                schedule.run_pending()
-                # 명령 폴링도 함께 수행
-                try:
-                    asyncio.run(self.poll_commands())
-                except Exception:
-                    pass
-                time.sleep(60)  # 1분마다 체크
+                # 1초 단위로 폴링+스케줄 작업 수행
+                for _ in range(60):
+                    schedule.run_pending()
+                    try:
+                        asyncio.run(self.poll_commands())
+                    except Exception:
+                        pass
+                    time.sleep(1)
             except KeyboardInterrupt:
                 logger.info("봇 종료됨")
                 break
             except Exception as e:
                 logger.error(f"스케줄러 오류: {e}")
-                time.sleep(60)
+                time.sleep(5)
 
     def run_ws(self):
         """바이낸스 선물 Kline WebSocket 구독(캔들 마감 시 신호 평가)"""

@@ -1,0 +1,16 @@
+# 텔레그램 봇 설정
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+
+# 바이낸스 API 설정
+BINANCE_API_KEY=your_binance_api_key_here
+BINANCE_SECRET_KEY=your_binance_secret_key_here
+
+# 시그널 설정 (선택사항)
+SIGNAL_INTERVAL=30
+LEVERAGE_DEFAULT=10
+RISK_PERCENTAGE=2.0
+
+
+https://api.telegram.org/bot봇Token값/getUpdates
+출처: https://gabrielkim.tistory.com/entry/Telegram-Bot-Token-및-Chat-Id-얻기 [행복둥이들의 이야기:티스토리]

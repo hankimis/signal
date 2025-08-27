@@ -3,6 +3,7 @@ import logging
 import json
 import pandas as pd
 from telegram import Bot
+from telegram.request import HTTPXRequest
 from telegram.error import TelegramError
 from datetime import datetime
 import schedule
@@ -19,7 +20,12 @@ logger = logging.getLogger(__name__)
 
 class SignalBot:
     def __init__(self):
-        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        # 텔레그램 요청 타임아웃 상향 및 안정화
+        try:
+            request = HTTPXRequest(connect_timeout=10, read_timeout=30)
+            self.bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
+        except Exception:
+            self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.analyzer = MarketAnalyzer()
         self.generator = AdvancedSignalGenerator()
         self.sent_signals = set()  # 중복 전송 방지
@@ -557,8 +563,17 @@ class SignalBot:
                 symbol = parts[1] if len(parts) > 1 else 'BTCUSDT'
                 interval = parts[2] if len(parts) > 2 else '30m'
                 lookback = int(parts[3]) if len(parts) > 3 else 400
-                report = bt_simple(symbol, interval, lookback)
-                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🧪 백테스트 결과\n{report}")
+                # 즉시 응답 후 백그라운드로 실행
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🧪 백테스트 시작: {symbol} {interval} {lookback}캔들…")
+                async def _run_bt():
+                    try:
+                        loop = asyncio.get_running_loop()
+                        report = await loop.run_in_executor(None, lambda: bt_simple(symbol, interval, lookback))
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🧪 백테스트 결과\n{report}")
+                    except Exception as e:
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"백테스트 오류: {e}")
+                asyncio.create_task(_run_bt())
+                return
             elif cmd == '/status':
                 open_cnt = len(self.open_signals)
                 msg = (
@@ -571,8 +586,16 @@ class SignalBot:
                 await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
             elif cmd == '/top':
                 limit = int(parts[1]) if len(parts) > 1 else 15
-                syms = self.analyzer.get_top_symbols(limit=limit)
-                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"💠 상위 심볼 {len(syms)}개\n" + ', '.join(syms))
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔎 상위 심볼 계산 중…({limit})")
+                async def _run_top():
+                    try:
+                        loop = asyncio.get_running_loop()
+                        syms = await loop.run_in_executor(None, lambda: self.analyzer.get_top_symbols(limit=limit))
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"💠 상위 심볼 {len(syms)}개\n" + ', '.join(syms))
+                    except Exception as e:
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"상위 심볼 오류: {e}")
+                asyncio.create_task(_run_top())
+                return
             elif cmd == '/open':
                 if not self.open_signals:
                     await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="열린 시그널 없음")
@@ -584,56 +607,59 @@ class SignalBot:
             elif cmd in ('/metrics','/why','/debug'):
                 symbol = parts[1] if len(parts) > 1 else 'BTCUSDT'
                 interval = parts[2] if len(parts) > 2 else '30m'
-                df = self.analyzer.get_klines(symbol, interval=interval, limit=240, exclude_last_open=True)
-                if df is None:
-                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"데이터 없음: {symbol} {interval}")
-                    return
-                df = self.analyzer.calculate_technical_indicators(df)
-                if df is None:
-                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"지표 계산 실패: {symbol} {interval}")
-                    return
-                cur = df.iloc[-1]
-                # 파생 데이터
-                fr = self.analyzer.get_funding_rate(symbol)
-                oi = self.analyzer.get_open_interest_usdt(symbol)
-                lsr = self.analyzer.get_long_short_ratio(symbol)
-                # 레짐 체크
-                try:
-                    atr_pct = float(cur['atr'] / cur['close'] * 100) if cur['close'] else float('nan')
-                    bbw = float(cur['bb_width']) if pd.notna(cur['bb_width']) else float('nan')
-                except Exception:
-                    atr_pct, bbw = float('nan'), float('nan')
-                regime_ok = (
-                    (atr_pct == atr_pct and ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX) and
-                    (bbw == bbw and BB_WIDTH_MIN <= bbw <= BB_WIDTH_MAX)
-                )
-                # MTF 컨펌(방향별)
-                mtf_long = self.analyzer._mtf_confirm(symbol, 'LONG')
-                mtf_short = self.analyzer._mtf_confirm(symbol, 'SHORT')
-                # 시그널 프리뷰
-                base = self.analyzer.generate_signal(
-                    symbol, df, interval=interval,
-                    relaxed=REALTIME_RELAXED and RELAXED_IGNORE_MTF,
-                    ignore_derivatives=REALTIME_RELAXED and RELAXED_IGNORE_DERIVATIVES
-                )
-                preview = "없음"
-                rr_txt = ""
-                if base:
-                    rr = self.generator.calculate_risk_reward_ratio(base['entry_prices'][0], base['stop_loss'], base['profit_targets'])
-                    if rr and rr.get('avg_reward_ratio') is not None:
-                        rr_txt = f" | R:R {float(rr['avg_reward_ratio']):.2f}"
-                    preview = f"{base['type']} | 신뢰도 {base.get('confidence','-')}%{rr_txt}"
-                # 메시지
-                msg = (
-                    f"🔎 {symbol} {interval} 지표\n"
-                    f"가격 {float(cur['close']):.6f} | RSI {float(cur['rsi']):.2f} | ADX {float(cur['adx']):.2f}\n"
-                    f"MACD {float(cur['macd']):.4f} / {float(cur['macd_signal']):.4f} (hist {float(cur['macd_histogram']):.4f})\n"
-                    f"BB폭 {bbw:.4%} | ATR {float(cur['atr']):.6f} ({atr_pct:.2f}%)\n"
-                    f"펀딩 {fr:.4f}% | OI ${oi:,.0f} | 롱숏비 {lsr:.2f}\n"
-                    f"레짐 {'OK' if regime_ok else 'FAIL'} | MTF L:{'OK' if mtf_long else 'NO'} S:{'OK' if mtf_short else 'NO'}\n"
-                    f"시그널 프리뷰: {preview}"
-                )
-                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"📊 지표 계산 중… {symbol} {interval}")
+                async def _run_metrics():
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # 블로킹 I/O는 스레드 풀에서 처리
+                        import functools
+                        get_df = functools.partial(self.analyzer.get_klines, symbol, interval=interval, limit=240, exclude_last_open=True)
+                        df = await loop.run_in_executor(None, get_df)
+                        if df is None:
+                            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"데이터 없음: {symbol} {interval}")
+                            return
+                        calc = functools.partial(self.analyzer.calculate_technical_indicators, df)
+                        df = await loop.run_in_executor(None, calc)
+                        if df is None:
+                            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"지표 계산 실패: {symbol} {interval}")
+                            return
+                        cur = df.iloc[-1]
+                        fr = await loop.run_in_executor(None, lambda: self.analyzer.get_funding_rate(symbol))
+                        oi = await loop.run_in_executor(None, lambda: self.analyzer.get_open_interest_usdt(symbol))
+                        lsr = await loop.run_in_executor(None, lambda: self.analyzer.get_long_short_ratio(symbol))
+                        try:
+                            atr_pct = float(cur['atr'] / cur['close'] * 100) if cur['close'] else float('nan')
+                            bbw = float(cur['bb_width']) if pd.notna(cur['bb_width']) else float('nan')
+                        except Exception:
+                            atr_pct, bbw = float('nan'), float('nan')
+                        regime_ok = (
+                            (atr_pct == atr_pct and ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX) and
+                            (bbw == bbw and BB_WIDTH_MIN <= bbw <= BB_WIDTH_MAX)
+                        )
+                        base = await loop.run_in_executor(None, lambda: self.analyzer.generate_signal(
+                            symbol, df, interval=interval,
+                            relaxed=REALTIME_RELAXED and RELAXED_IGNORE_MTF,
+                            ignore_derivatives=REALTIME_RELAXED and RELAXED_IGNORE_DERIVATIVES
+                        ))
+                        preview = "없음"; rr_txt = ""
+                        if base:
+                            rr = self.generator.calculate_risk_reward_ratio(base['entry_prices'][0], base['stop_loss'], base['profit_targets'])
+                            if rr and rr.get('avg_reward_ratio') is not None:
+                                rr_txt = f" | R:R {float(rr['avg_reward_ratio']):.2f}"
+                            preview = f"{base['type']} | 신뢰도 {base.get('confidence','-')}%{rr_txt}"
+                        msg = (
+                            f"🔎 {symbol} {interval} 지표\n"
+                            f"가격 {float(cur['close']):.6f} | RSI {float(cur['rsi']):.2f} | ADX {float(cur['adx']):.2f}\n"
+                            f"MACD {float(cur['macd']):.4f} / {float(cur['macd_signal']):.4f} (hist {float(cur['macd_histogram']):.4f})\n"
+                            f"BB폭 {bbw:.4%} | ATR {float(cur['atr']):.6f} ({atr_pct:.2f}%)\n"
+                            f"펀딩 {fr:.4f}% | OI ${oi:,.0f} | 롱숏비 {lsr:.2f}\n"
+                            f"레짐 {'OK' if regime_ok else 'FAIL'} | 시그널 프리뷰: {preview}"
+                        )
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                    except Exception as e:
+                        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"metrics 오류: {e}")
+                asyncio.create_task(_run_metrics())
+                return
         except Exception as e:
             logger.error(f"명령 처리 오류: {e}")
 
